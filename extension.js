@@ -59,81 +59,86 @@ function activate(context) {
     });
 
     socket.on("sync_state", (state) => {
-        decoProvider.editingFiles = new Map(Object.entries(state.editing));
-        decoProvider.unpushedFiles = new Map(Object.entries(state.unpushed));
-        decoProvider.refresh();
-    });
+    // Filter Editing: Remove any entries where the user is ME
+    const filteredEditing = new Map();
+    for (const [file, user] of Object.entries(state.editing)) {
+        if (user !== MY_NAME) {
+            filteredEditing.set(file, user);
+        }
+    }
+    decoProvider.editingFiles = filteredEditing;
+
+    // Filter Unpushed: Remove ME from the arrays
+    const filteredUnpushed = Object.entries(state.unpushed).reduce((acc, [file, users]) => {
+        const others = users.filter(u => u !== MY_NAME);
+        if (others.length > 0) acc.push([file, others]);
+        return acc;
+    }, []);
+    
+    decoProvider.unpushedFiles = new Map(filteredUnpushed);
+    decoProvider.refresh();
+});
 
     socket.on("update_editing", (data) => {
-        console.log(data.user);
-        if (!(data.user === MY_NAME)) return;
-        
-        // Only refresh if state actually changes
-        if (decoProvider.editingFiles.get(data.file) !== data.user) {
-            decoProvider.editingFiles.set(data.file, data.user);
+    // 🛑 STOP: If the message is about me, ignore it immediately.
+    if (data.user === MY_NAME) return;
+
+    // Only add to the map if it's someone else
+    decoProvider.editingFiles.set(data.file, data.user);
+    decoProvider.refresh();
+
+    // Auto-clear their icon after 15s of silence
+    setTimeout(() => {
+        if (decoProvider.editingFiles.get(data.file) === data.user) {
+            decoProvider.editingFiles.delete(data.file);
             decoProvider.refresh();
         }
-
-        // Auto-clear remote user icon after 15s of their silence
-        setTimeout(() => {
-            if (decoProvider.editingFiles.get(data.file) === data.user) {
-                decoProvider.editingFiles.delete(data.file);
-                decoProvider.refresh();
-            }
-        }, 15000);
-    });
+    }, 15000);
+});
 
     socket.on("update_unpushed", (unpushedObj) => {
-        decoProvider.unpushedFiles = new Map(Object.entries(unpushedObj));
-        decoProvider.refresh();
-    });
+    const filtered = Object.entries(unpushedObj).reduce((acc, [file, users]) => {
+        const others = users.filter(u => u !== MY_NAME);
+        // Only add the file to the map if someone OTHER than you has changes
+        if (others.length > 0) {
+            acc.push([file, others]);
+        }
+        return acc;
+    }, []);
+
+    decoProvider.unpushedFiles = new Map(filtered);
+    decoProvider.refresh();
+});
 
     // 🔹 IMPROVED: Smoother Watcher
-    const watcher = vscode.workspace.onDidChangeTextDocument(event => {
-        const relativePath = vscode.workspace.asRelativePath(event.document.uri);
+    const editWatcher = vscode.workspace.onDidChangeTextDocument(event => {
+    const relativePath = vscode.workspace.asRelativePath(event.document.uri);
 
-        // Clear existing debounce
-        if (editDebounceTimers.has(relativePath)) {
-            clearTimeout(editDebounceTimers.get(relativePath));
-        }
+    if (editDebounceTimers.has(relativePath)) {
+        clearTimeout(editDebounceTimers.get(relativePath));
+    }
 
-        // Set a timer to update UI and Server ONLY after user stops typing
-        const timer = setTimeout(() => {
-            // Local Update
-            if (!decoProvider.editingFiles.has(relativePath)) {
-                decoProvider.editingFiles.set(relativePath, MY_NAME);
-                decoProvider.refresh();
-            }
+    const timer = setTimeout(() => {
+        socket.emit("file_editing", {
+            user: MY_NAME,
+            repo: getRepoId(),
+            file: relativePath
+        });
+        editDebounceTimers.delete(relativePath);
+    }, EDIT_DEBOUNCE_MS);
 
-            // Server Update
-            socket.emit("file_editing", {
-                user: MY_NAME,
-                repo: getRepoId(),
-                file: relativePath
-            });
+    editDebounceTimers.set(relativePath, timer);
+});
 
-            // Self-cleanup
-            setTimeout(() => {
-                if (decoProvider.editingFiles.get(relativePath) === MY_NAME) {
-                    decoProvider.editingFiles.delete(relativePath);
-                    decoProvider.refresh();
-                }
-            }, 10000);
 
-            // Execute the Git reminder check ONLY when typing pauses
-            checkGitReminders(); 
-
-            editDebounceTimers.delete(relativePath);
-        }, EDIT_DEBOUNCE_MS);
-
-        editDebounceTimers.set(relativePath, timer);
-    });
 
     // Run heavy git checks every 15s (increased from 10s for performance)
-    setInterval(() => checkGitStatus(), 15000);
+    const saveWatcher = vscode.workspace.onDidSaveTextDocument(document => {
+    // Immediate check when a file is saved
+    checkGitStatus();
+});
 
-    context.subscriptions.push(watcher);
-}
+context.subscriptions.push(saveWatcher, editWatcher);}
 
 // 🔹 IMPROVED: Using async exec to prevent UI "micro-freezes"
 function checkGitReminders() {
@@ -183,25 +188,20 @@ function checkGitStatus() {
 
         const allChangedFiles = [...new Set(output.trim().split("\n").filter(Boolean))];
         
-        if (allChangedFiles.length > 0) {
-            // Tell the server: "I have these files in a 'pending' state"
-            socket.emit("file_committed", { 
-                repo: repoId, 
-                files: allChangedFiles, 
-                user: MY_NAME 
-            });
-
-            // Update local UI
-            decoProvider.unpushedFiles = new Map(allChangedFiles.map(f => [f, [MY_NAME]]));
-            decoProvider.refresh();
-        } else {
-            // No changes at all? Clear the icons.
-            socket.emit("repo_pushed", repoId);
-            if (decoProvider.unpushedFiles.size > 0) {
-                decoProvider.unpushedFiles.clear();
-                decoProvider.refresh();
-            }
-        }
+        // Inside checkGitStatus()
+if (allChangedFiles.length > 0) {
+    socket.emit("file_committed", { 
+        repo: repoId, 
+        files: allChangedFiles, 
+        user: MY_NAME 
+    });
+} else {
+    // FIX: Only tell the server to clear YOUR changes, not the whole repo
+    socket.emit("user_cleared_changes", {
+        repo: repoId,
+        user: MY_NAME
+    });
+}
     });
 }
 

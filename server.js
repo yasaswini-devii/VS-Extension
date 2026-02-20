@@ -8,6 +8,7 @@ function ensureRepo(repoId) {
     if (!repoState[repoId]) {
         repoState[repoId] = { editing: {}, unpushed: {} };
     }
+    console.log(repoId);
     return repoState[repoId];
 }
 
@@ -40,5 +41,22 @@ io.on("connection", (socket) => {
         state.unpushed = {};
         io.to(repoId).emit("update_unpushed", {});
     });
+
+    socket.on("user_cleared_changes", (data) => {
+    const state = ensureRepo(data.repo);
+    
+    // Iterate through every file and remove this specific user
+    Object.keys(state.unpushed).forEach(file => {
+        state.unpushed[file] = state.unpushed[file].filter(u => u !== data.user);
+        
+        // Clean up the file key if no one else has changes there
+        if (state.unpushed[file].length === 0) {
+            delete state.unpushed[file];
+        }
+    });
+
+    // Broadcast the updated (and cleaned) list to everyone
+    io.to(data.repo).emit("update_unpushed", state.unpushed);
+});
 });
 console.log("Server running on port 3000");
