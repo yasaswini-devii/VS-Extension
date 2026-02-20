@@ -1,9 +1,9 @@
 const vscode = require("vscode");
 const io = require("socket.io-client");
-const { execSync } = require("child_process");
+const { execSync, exec } = require("child_process"); // Added exec for async
 
 const SERVER_URL = "http://172.16.26.182:3000";
-const EDIT_DEBOUNCE_MS = 800; // reduce chatty emits per file
+const EDIT_DEBOUNCE_MS = 1000; // Increased slightly for "calmer" UI
 let socket;
 let MY_NAME = "Unknown";
 const editDebounceTimers = new Map();
@@ -23,7 +23,6 @@ class TeamDecorationProvider {
     provideFileDecoration(uri) {
         const relPath = vscode.workspace.asRelativePath(uri);
         
-        // Icon for Active Editing
         if (this.editingFiles.has(relPath)) {
             return {
                 badge: "📝",
@@ -32,7 +31,6 @@ class TeamDecorationProvider {
             };
         }
 
-        // Icon for Unpushed Changes
         if (this.unpushedFiles.has(relPath)) {
             const users = this.unpushedFiles.get(relPath);
             return {
@@ -67,14 +65,22 @@ function activate(context) {
     });
 
     socket.on("update_editing", (data) => {
-        if (data.user === MY_NAME) return; // already rendered locally
-        decoProvider.editingFiles.set(data.file, data.user);
-        decoProvider.refresh();
-        // Clear after 10s of inactivity
-        setTimeout(() => {
-            decoProvider.editingFiles.delete(data.file);
+        console.log(data.user);
+        if (!(data.user === MY_NAME)) return;
+        
+        // Only refresh if state actually changes
+        if (decoProvider.editingFiles.get(data.file) !== data.user) {
+            decoProvider.editingFiles.set(data.file, data.user);
             decoProvider.refresh();
-        }, 10000);
+        }
+
+        // Auto-clear remote user icon after 15s of their silence
+        setTimeout(() => {
+            if (decoProvider.editingFiles.get(data.file) === data.user) {
+                decoProvider.editingFiles.delete(data.file);
+                decoProvider.refresh();
+            }
+        }, 15000);
     });
 
     socket.on("update_unpushed", (unpushedObj) => {
@@ -82,54 +88,66 @@ function activate(context) {
         decoProvider.refresh();
     });
 
-    // 🔹 File edit watcher
+    // 🔹 IMPROVED: Smoother Watcher
     const watcher = vscode.workspace.onDidChangeTextDocument(event => {
         const relativePath = vscode.workspace.asRelativePath(event.document.uri);
-        // Update local decorations immediately so the author also sees the badge.
-        decoProvider.editingFiles.set(relativePath, MY_NAME);
-        decoProvider.refresh();
-        setTimeout(() => {
-            decoProvider.editingFiles.delete(relativePath);
-            decoProvider.refresh();
-        }, 10000);
 
-        // Debounce edit pings to avoid spamming the server per keystroke.
+        // Clear existing debounce
         if (editDebounceTimers.has(relativePath)) {
             clearTimeout(editDebounceTimers.get(relativePath));
         }
-        editDebounceTimers.set(relativePath, setTimeout(() => {
+
+        // Set a timer to update UI and Server ONLY after user stops typing
+        const timer = setTimeout(() => {
+            // Local Update
+            if (!decoProvider.editingFiles.has(relativePath)) {
+                decoProvider.editingFiles.set(relativePath, MY_NAME);
+                decoProvider.refresh();
+            }
+
+            // Server Update
             socket.emit("file_editing", {
                 user: MY_NAME,
                 repo: getRepoId(),
                 file: relativePath
             });
+
+            // Self-cleanup
+            setTimeout(() => {
+                if (decoProvider.editingFiles.get(relativePath) === MY_NAME) {
+                    decoProvider.editingFiles.delete(relativePath);
+                    decoProvider.refresh();
+                }
+            }, 10000);
+
+            // Execute the Git reminder check ONLY when typing pauses
+            checkGitReminders(); 
+
             editDebounceTimers.delete(relativePath);
-        }, EDIT_DEBOUNCE_MS));
-        
-        // Bring back your reminder check!
-        checkGitReminders();
+        }, EDIT_DEBOUNCE_MS);
+
+        editDebounceTimers.set(relativePath, timer);
     });
 
-    // Periodic Git check (every 10s)
-    setInterval(() => checkGitStatus(), 10000);
+    // Run heavy git checks every 15s (increased from 10s for performance)
+    setInterval(() => checkGitStatus(), 15000);
 
     context.subscriptions.push(watcher);
 }
 
-// 🔹 Your original reminder logic restored
+// 🔹 IMPROVED: Using async exec to prevent UI "micro-freezes"
 function checkGitReminders() {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) return;
     const repoRoot = workspaceFolders[0].uri.fsPath;
 
-    try {
-        const output = execSync("git status --porcelain", { cwd: repoRoot, encoding: "utf8" }).trim();
-        const changedFiles = output ? output.split("\n").length : 0;
-
+    exec("git status --porcelain", { cwd: repoRoot }, (err, stdout) => {
+        if (err) return;
+        const changedFiles = stdout ? stdout.trim().split("\n").length : 0;
         if (changedFiles > 5) {
-            vscode.window.showWarningMessage(`TeamWatcher: You have ${changedFiles} uncommitted changes! Consider committing.`);
+            vscode.window.showWarningMessage(`TeamWatcher: You have ${changedFiles} uncommitted changes!`);
         }
-    } catch (e) { console.error("Git Reminder Error:", e.message); }
+    });
 }
 
 function getRepoId() {
@@ -147,26 +165,44 @@ function checkGitStatus() {
     if (!vscode.workspace.workspaceFolders) return;
     const root = vscode.workspace.workspaceFolders[0].uri.fsPath;
     const repoId = getRepoId();
-    try {
-        // Detect local files ahead of origin
-        const unpushedFiles = execSync("git diff --name-only @{u} HEAD", { cwd: root })
-            .toString().trim().split("\n").filter(Boolean);
+    
+    // This command finds:
+    // 1. Unpushed commits: @{u}..HEAD
+    // 2. Unstaged/Staged changes: HEAD (tracked files only)
+    // 3. Untracked files: --others --exclude-standard
+    const cmd = 'git diff --name-only @{u} HEAD && git ls-files -m --others --exclude-standard';
+
+    exec(cmd, { cwd: root }, (err, stdout) => {
+        // If there's an error (e.g., no upstream set), we fall back to just local changes
+        let output = stdout;
+        if (err) {
+            try {
+                output = execSync('git ls-files -m --others --exclude-standard', { cwd: root }).toString();
+            } catch(e) { output = ""; }
+        }
+
+        const allChangedFiles = [...new Set(output.trim().split("\n").filter(Boolean))];
         
-        if (unpushedFiles.length > 0) {
-            socket.emit("file_committed", { repo: repoId, files: unpushedFiles, user: MY_NAME });
-            // Also reflect locally so the author sees their own unpushed badge.
-            decoProvider.unpushedFiles = new Map(
-                unpushedFiles.map(f => [f, [MY_NAME]])
-            );
+        if (allChangedFiles.length > 0) {
+            // Tell the server: "I have these files in a 'pending' state"
+            socket.emit("file_committed", { 
+                repo: repoId, 
+                files: allChangedFiles, 
+                user: MY_NAME 
+            });
+
+            // Update local UI
+            decoProvider.unpushedFiles = new Map(allChangedFiles.map(f => [f, [MY_NAME]]));
             decoProvider.refresh();
         } else {
+            // No changes at all? Clear the icons.
             socket.emit("repo_pushed", repoId);
             if (decoProvider.unpushedFiles.size > 0) {
                 decoProvider.unpushedFiles.clear();
                 decoProvider.refresh();
             }
         }
-    } catch (e) { /* No upstream set yet */ }
+    });
 }
 
 function deactivate() { if (socket) socket.disconnect(); }
