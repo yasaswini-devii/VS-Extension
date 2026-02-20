@@ -1,36 +1,59 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
-const vscode = require('vscode');
+const vscode = require("vscode");
+const io = require("socket.io-client");
+const { execSync } = require("child_process");
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
+let MY_NAME = "Unknown";
+try { MY_NAME = execSync("git config user.name").toString().trim(); } 
+catch (e) {}
 
-/**
- * @param {vscode.ExtensionContext} context
- */
+const SERVER_URL = "http://localhost:3000"; // Change if server is remote
+const socket = io(SERVER_URL);
+
 function activate(context) {
+    vscode.window.showInformationMessage(`CodeSync activated as ${MY_NAME}`);
 
-	// Use the console to output diagnostic information (console.log) and errors (console.error)
-	// This line of code will only be executed once when your extension is activated
-	console.log('Congratulations, your extension "teamwatcher" is now active!');
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) return;
 
-	// The command has been defined in the package.json file
-	// Now provide the implementation of the command with  registerCommand
-	// The commandId parameter must match the command field in package.json
-	const disposable = vscode.commands.registerCommand('teamwatcher.helloWorld', function () {
-		// The code you place here will be executed every time your command is executed
+    const REPO_ROOT = workspaceFolders[0].uri.fsPath;
+    const REPO_NAME = vscode.workspace.asRelativePath(REPO_ROOT);
 
-		// Display a message box to the user
-		vscode.window.showInformationMessage('Hello World from teamwatcher!');
-	});
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*');
+    watcher.onDidChange(uri => {
+        const relativePath = vscode.workspace.asRelativePath(uri);
+        socket.emit("file_editing", {
+            user: MY_NAME,
+            file: `${REPO_NAME}/${relativePath.replace(/\\/g, "/")}`
+        });
 
-	context.subscriptions.push(disposable);
+        checkGitReminders(REPO_ROOT);
+    });
+
+    socket.on("show_toast", data => {
+        vscode.window.showWarningMessage(`${data.user} is editing ${data.file}. Avoid conflicts!`);
+    });
+
+    context.subscriptions.push(watcher);
 }
 
-// This method is called when your extension is deactivated
-function deactivate() {}
+function checkGitReminders(repoRoot) {
+    try {
+        const changedFilesOutput = execSync("git status --porcelain", { cwd: repoRoot }).toString().trim();
+        const changedFiles = changedFilesOutput ? changedFilesOutput.split("\n").length : 0;
 
-module.exports = {
-	activate,
-	deactivate
+        const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repoRoot }).toString().trim();
+        const unpushedCommitsOutput = execSync(`git log origin/${branch}..HEAD --oneline`, { cwd: repoRoot }).toString().trim();
+        const unpushedCommits = unpushedCommitsOutput ? unpushedCommitsOutput.split("\n").length : 0;
+
+        if (changedFiles > 5) vscode.window.showWarningMessage(`You have ${changedFiles} modified files. Consider committing!`);
+        if (unpushedCommits > 3) vscode.window.showWarningMessage(`You have ${unpushedCommits} unpushed commits. Consider pushing!`);
+    } catch (e) {
+        console.warn("Git check failed:", e.message);
+    }
 }
+
+function deactivate() {
+    socket.disconnect();
+}
+
+module.exports = { activate, deactivate };
