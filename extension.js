@@ -3,35 +3,47 @@ const io = require("socket.io-client");
 const { execSync } = require("child_process");
 
 let MY_NAME = "Unknown";
-try { MY_NAME = execSync("git config user.name").toString().trim(); } 
-catch (e) {}
+try { 
+    MY_NAME = execSync("git config user.name").toString().trim(); 
+} catch (e) {
+    MY_NAME = process.env.USER || process.env.USERNAME || "Collaborator";
+}
 
-const SERVER_URL = "http://localhost:3000"; // Change if server is remote
+const SERVER_URL = "http://172.16.26.182:3000"; 
 const socket = io(SERVER_URL);
 
+// Prevents spamming the server on every single character typed
+let editTimeout;
+
 function activate(context) {
-    vscode.window.showInformationMessage(`CodeSync activated as ${MY_NAME}`);
+    vscode.window.showInformationMessage(`CodeSync active: Logged in as ${MY_NAME}`);
 
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders) return;
+    // --- 1. LISTEN FOR OTHERS ---
+    socket.on("show_toast", (data) => {
+        // Person B receives this when Person A edits
+        vscode.window.showWarningMessage(
+            `Conflict Warning: ${data.user} is currently editing ${data.file}`
+        );
+    });
 
-    const REPO_ROOT = workspaceFolders[0].uri.fsPath;
-    const REPO_NAME = vscode.workspace.asRelativePath(REPO_ROOT);
-
+    // --- 2. SEND YOUR UPDATES ---
     const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    watcher.onDidChange(uri => {
-        const relativePath = vscode.workspace.asRelativePath(uri);
-        socket.emit("file_editing", {
-            user: MY_NAME,
-            file: `${REPO_NAME}/${relativePath.replace(/\\/g, "/")}`
-        });
-
-        checkGitReminders(REPO_ROOT);
-    });
-
-    socket.on("show_toast", data => {
-        vscode.window.showWarningMessage(`${data.user} is editing ${data.file}. Avoid conflicts!`);
-    });
+    
+    context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => {
+        const fileName = vscode.workspace.asRelativePath(event.document.uri);
+        
+        clearTimeout(editTimeout);
+        editTimeout = setTimeout(() => {
+            socket.emit("file_editing", {
+                user: MY_NAME,
+                file: fileName
+            });
+            
+            // Optional: Run your Git checks here
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (workspaceFolders) checkGitReminders(workspaceFolders[0].uri.fsPath);
+        }, 1000); // Only sends once every second of activity
+    }));
 
     context.subscriptions.push(watcher);
 }
@@ -41,19 +53,16 @@ function checkGitReminders(repoRoot) {
         const changedFilesOutput = execSync("git status --porcelain", { cwd: repoRoot }).toString().trim();
         const changedFiles = changedFilesOutput ? changedFilesOutput.split("\n").length : 0;
 
-        const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repoRoot }).toString().trim();
-        const unpushedCommitsOutput = execSync(`git log origin/${branch}..HEAD --oneline`, { cwd: repoRoot }).toString().trim();
-        const unpushedCommits = unpushedCommitsOutput ? unpushedCommitsOutput.split("\n").length : 0;
-
-        if (changedFiles > 5) vscode.window.showWarningMessage(`You have ${changedFiles} modified files. Consider committing!`);
-        if (unpushedCommits > 3) vscode.window.showWarningMessage(`You have ${unpushedCommits} unpushed commits. Consider pushing!`);
+        if (changedFiles > 5) {
+            vscode.window.showInformationMessage(`Reminder: You have ${changedFiles} unsaved changes.`);
+        }
     } catch (e) {
-        console.warn("Git check failed:", e.message);
+        // Git not initialized or not found
     }
 }
 
 function deactivate() {
-    socket.disconnect();
+    if (socket) socket.disconnect();
 }
 
 module.exports = { activate, deactivate };

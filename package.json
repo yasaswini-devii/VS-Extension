@@ -1,40 +1,34 @@
 {
   "name": "teamwatcher",
-  "displayName": "teamwatcher",
-  "description": "",
+  "displayName": "TeamWatcher",
+  "description": "Real-time collaboration and conflict alerts",
   "version": "0.0.1",
+  "publisher": "your-name-here",
   "engines": {
-    "vscode": "^1.109.0"
+    "vscode": "^1.70.0"
   },
   "categories": [
     "Other"
   ],
-  "activationEvents": ["onStartupFinished",
-    "onCommand:extension.startMonitoring"],
+  "activationEvents": [
+    "*"
+  ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       {
         "command": "extension.startMonitoring",
-          "title": "Start Project Monitor"
+        "title": "Start Project Monitor"
       }
     ]
   },
-  "scripts": {
-    "lint": "eslint .",
-    "pretest": "npm run lint",
-    "test": "vscode-test"
-  },
-  "devDependencies": {
-    "@types/mocha": "^10.0.10",
-    "@types/node": "22.x",
-    "@types/vscode": "^1.109.0",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2",
-    "eslint": "^9.39.2"
-  },
   "dependencies": {
+    "socket-io": "^1.0.0",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.70.0",
+    "@vscode/vsce": "^2.15.0"
   }
 }
