@@ -20,6 +20,16 @@
         "command": "extension.startMonitoring",
         "title": "Start Project Monitor"
       }
+    ],
+    "colors": [
+      {
+        "id": "teamwatcher.editing",
+        "description": "Color for files being edited by others",
+        "defaults": {
+          "dark": "#ffca28",
+          "light": "#ffb300"
+        }
+      }
     ]
   },
   "dependencies": {

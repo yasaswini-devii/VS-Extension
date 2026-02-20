@@ -1,230 +1,174 @@
 const vscode = require("vscode");
 const io = require("socket.io-client");
 const { execSync } = require("child_process");
-const path = require("path");
-const fs = require("fs");
 
-// 🔹 Change to your server IP
 const SERVER_URL = "http://172.16.26.182:3000";
-const socket = io(SERVER_URL, { transports: ["websocket"] });
-
+const EDIT_DEBOUNCE_MS = 800; // reduce chatty emits per file
+let socket;
 let MY_NAME = "Unknown";
-try {
-    MY_NAME = execSync("git config user.name").toString().trim();
-} catch (e) {
-    MY_NAME = "User-" + Math.floor(Math.random() * 1000);
-}
+const editDebounceTimers = new Map();
 
-// 🔹 Controls popup spam (once per category per session)
-let shownCategoryWarnings = new Set();
+class TeamDecorationProvider {
+    constructor() {
+        this._onDidChangeFileDecorations = new vscode.EventEmitter();
+        this.onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
+        this.editingFiles = new Map(); 
+        this.unpushedFiles = new Map(); 
+    }
 
-// 🔹 Prevents re-adding same ignore entry again in session
-let handledIgnoreEntries = new Set();
+    refresh() {
+        this._onDidChangeFileDecorations.fire();
+    }
 
-function getRemoteUrl(repoRoot) {
-    try {
-        return execSync("git config --get remote.origin.url", {
-            cwd: repoRoot
-        }).toString().trim();
-    } catch (e) {
+    provideFileDecoration(uri) {
+        const relPath = vscode.workspace.asRelativePath(uri);
+        
+        // Icon for Active Editing
+        if (this.editingFiles.has(relPath)) {
+            return {
+                badge: "📝",
+                tooltip: `${this.editingFiles.get(relPath)} is editing now`,
+                color: new vscode.ThemeColor("charts.yellow")
+            };
+        }
+
+        // Icon for Unpushed Changes
+        if (this.unpushedFiles.has(relPath)) {
+            const users = this.unpushedFiles.get(relPath);
+            return {
+                badge: "↑",
+                tooltip: `Unpushed changes by: ${users.join(", ")}`,
+                color: new vscode.ThemeColor("charts.blue")
+            };
+        }
         return null;
     }
 }
 
+const decoProvider = new TeamDecorationProvider();
+
 function activate(context) {
-    console.log("TeamWatcher extension is now active!");
+    try {
+        MY_NAME = execSync("git config user.name").toString().trim();
+    } catch (e) { MY_NAME = "User-" + Math.floor(Math.random() * 100); }
+
+    socket = io(SERVER_URL, { transports: ["websocket"] });
+    context.subscriptions.push(vscode.window.registerFileDecorationProvider(decoProvider));
 
     socket.on("connect", () => {
         vscode.window.showInformationMessage("Connected to CodeSync Server!");
-
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (workspaceFolders) {
-            const rootPath = workspaceFolders[0].uri.fsPath;
-            const ROOM_ID = getRemoteUrl(rootPath) || vscode.workspace.name;
-            socket.emit("join_repo", ROOM_ID);
-        }
+        socket.emit("join_repo", getRepoId());
     });
 
-    socket.on("connect_error", (err) => {
-        console.error("Connection Failed:", err.message);
+    socket.on("sync_state", (state) => {
+        decoProvider.editingFiles = new Map(Object.entries(state.editing));
+        decoProvider.unpushedFiles = new Map(Object.entries(state.unpushed));
+        decoProvider.refresh();
     });
 
-    socket.on("show_toast", (data) => {
-        if (data.user !== MY_NAME) {
-            vscode.window.showWarningMessage(
-                `⚠️ ${data.user} is editing ${data.file}`
-            );
-        }
+    socket.on("update_editing", (data) => {
+        if (data.user === MY_NAME) return; // already rendered locally
+        decoProvider.editingFiles.set(data.file, data.user);
+        decoProvider.refresh();
+        // Clear after 10s of inactivity
+        setTimeout(() => {
+            decoProvider.editingFiles.delete(data.file);
+            decoProvider.refresh();
+        }, 10000);
+    });
+
+    socket.on("update_unpushed", (unpushedObj) => {
+        decoProvider.unpushedFiles = new Map(Object.entries(unpushedObj));
+        decoProvider.refresh();
     });
 
     // 🔹 File edit watcher
-    let editTimeout;
     const watcher = vscode.workspace.onDidChangeTextDocument(event => {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (!workspaceFolders) return;
-
-        const rootPath = workspaceFolders[0].uri.fsPath;
-        const ROOM_ID = getRemoteUrl(rootPath) || vscode.workspace.name;
         const relativePath = vscode.workspace.asRelativePath(event.document.uri);
+        // Update local decorations immediately so the author also sees the badge.
+        decoProvider.editingFiles.set(relativePath, MY_NAME);
+        decoProvider.refresh();
+        setTimeout(() => {
+            decoProvider.editingFiles.delete(relativePath);
+            decoProvider.refresh();
+        }, 10000);
 
-        clearTimeout(editTimeout);
-        editTimeout = setTimeout(() => {
+        // Debounce edit pings to avoid spamming the server per keystroke.
+        if (editDebounceTimers.has(relativePath)) {
+            clearTimeout(editDebounceTimers.get(relativePath));
+        }
+        editDebounceTimers.set(relativePath, setTimeout(() => {
             socket.emit("file_editing", {
                 user: MY_NAME,
-                repo: ROOM_ID,
+                repo: getRepoId(),
                 file: relativePath
             });
-
-            checkGitReminders(rootPath);
-        }, 1000);
+            editDebounceTimers.delete(relativePath);
+        }, EDIT_DEBOUNCE_MS));
+        
+        // Bring back your reminder check!
+        checkGitReminders();
     });
 
+    // Periodic Git check (every 10s)
+    setInterval(() => checkGitStatus(), 10000);
+
     context.subscriptions.push(watcher);
-
-    // 🔹 Periodic staged file check
-    const interval = setInterval(() => {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (!workspaceFolders) return;
-        checkStagedFiles(workspaceFolders[0].uri.fsPath);
-    }, 2000);
-
-    context.subscriptions.push({ dispose: () => clearInterval(interval) });
 }
 
-function checkGitReminders(repoRoot) {
-    try {
-        const output = execSync("git status --porcelain", {
-            cwd: repoRoot,
-            encoding: "utf8"
-        }).trim();
+// 🔹 Your original reminder logic restored
+function checkGitReminders() {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) return;
+    const repoRoot = workspaceFolders[0].uri.fsPath;
 
+    try {
+        const output = execSync("git status --porcelain", { cwd: repoRoot, encoding: "utf8" }).trim();
         const changedFiles = output ? output.split("\n").length : 0;
 
         if (changedFiles > 5) {
-            vscode.window.showInformationMessage(
-                `TeamWatcher: You have ${changedFiles} uncommitted changes! Consider committing.`
-            );
+            vscode.window.showWarningMessage(`TeamWatcher: You have ${changedFiles} uncommitted changes! Consider committing.`);
         }
-    } catch (e) {
-        console.error("Git Reminder Error:", e.message);
-    }
+    } catch (e) { console.error("Git Reminder Error:", e.message); }
 }
 
-function checkStagedFiles(repoRoot) {
+function getRepoId() {
+    if (vscode.workspace.workspaceFolders) {
+        try {
+            return execSync("git config --get remote.origin.url", {
+                cwd: vscode.workspace.workspaceFolders[0].uri.fsPath
+            }).toString().trim();
+        } catch (e) { return vscode.workspace.name; }
+    }
+    return "unknown-repo";
+}
+
+function checkGitStatus() {
+    if (!vscode.workspace.workspaceFolders) return;
+    const root = vscode.workspace.workspaceFolders[0].uri.fsPath;
+    const repoId = getRepoId();
     try {
-        const output = execSync("git diff --cached --name-only", {
-            cwd: repoRoot,
-            encoding: "utf8"
-        }).trim();
-
-        if (!output) return;
-
-        const stagedFiles = output.split("\n");
-
-        let foundEnv = false;
-        let foundNodeModules = false;
-        let foundLargeFile = false;
-
-        const gitignorePath = path.join(repoRoot, ".gitignore");
-        let gitignoreContent = "";
-
-        if (fs.existsSync(gitignorePath)) {
-            gitignoreContent = fs.readFileSync(gitignorePath, "utf8");
-        }
-
-        const gitignoreLines = gitignoreContent
-            .split("\n")
-            .map(l => l.trim());
-
-        stagedFiles.forEach(file => {
-
-            const normalizedFile = file.replace(/\\/g, "/");
-            const fullPath = path.join(repoRoot, file);
-
-            if (!fs.existsSync(fullPath)) return;
-
-            const fileSize = fs.statSync(fullPath).size;
-            const isLarge = fileSize > 5 * 1024 * 1024;
-            const isEnv = normalizedFile.endsWith(".env");
-            const isNodeModules = normalizedFile.includes("node_modules/");
-
-            let ignoreEntry = null;
-
-            // 🔹 Handle node_modules (correct folder path)
-            if (isNodeModules) {
-                foundNodeModules = true;
-
-                const parts = normalizedFile.split("/");
-                const index = parts.indexOf("node_modules");
-                ignoreEntry =
-                    parts.slice(0, index + 1).join("/") + "/";
-            }
-
-            // 🔹 Handle .env (correct relative path)
-            else if (isEnv) {
-                foundEnv = true;
-                ignoreEntry = normalizedFile;
-            }
-
-            // 🔹 Handle large file
-            else if (isLarge) {
-                foundLargeFile = true;
-                ignoreEntry = normalizedFile;
-            }
-
-            else {
-                return;
-            }
-
-            // 🔹 Add to .gitignore only once per session
-            if (
-                ignoreEntry &&
-                !gitignoreLines.includes(ignoreEntry) &&
-                !handledIgnoreEntries.has(ignoreEntry)
-            ) {
-                fs.appendFileSync(gitignorePath, `\n${ignoreEntry}\n`);
-                handledIgnoreEntries.add(ignoreEntry);
-            }
-
-            // 🔹 Always unstage
-            execSync(`git restore --staged "${file}"`, {
-                cwd: repoRoot
-            });
-        });
-
-        // 🔹 Show popup only once per category per session
-
-        if (foundEnv && !shownCategoryWarnings.has("env")) {
-            vscode.window.showErrorMessage(
-                "🚨 .env file detected. Removed from staging."
+        // Detect local files ahead of origin
+        const unpushedFiles = execSync("git diff --name-only @{u} HEAD", { cwd: root })
+            .toString().trim().split("\n").filter(Boolean);
+        
+        if (unpushedFiles.length > 0) {
+            socket.emit("file_committed", { repo: repoId, files: unpushedFiles, user: MY_NAME });
+            // Also reflect locally so the author sees their own unpushed badge.
+            decoProvider.unpushedFiles = new Map(
+                unpushedFiles.map(f => [f, [MY_NAME]])
             );
-            shownCategoryWarnings.add("env");
+            decoProvider.refresh();
+        } else {
+            socket.emit("repo_pushed", repoId);
+            if (decoProvider.unpushedFiles.size > 0) {
+                decoProvider.unpushedFiles.clear();
+                decoProvider.refresh();
+            }
         }
-
-        if (foundNodeModules && !shownCategoryWarnings.has("node_modules")) {
-            vscode.window.showErrorMessage(
-                "🚨 node_modules detected. Removed from staging."
-            );
-            shownCategoryWarnings.add("node_modules");
-        }
-
-        if (foundLargeFile && !shownCategoryWarnings.has("large_file")) {
-            vscode.window.showErrorMessage(
-                "🚨 Large file (>5MB) detected. Removed from staging."
-            );
-            shownCategoryWarnings.add("large_file");
-        }
-
-    } catch (e) {
-        console.error("Staged File Check Error:", e.message);
-    }
+    } catch (e) { /* No upstream set yet */ }
 }
 
-function deactivate() {
-    if (socket) socket.disconnect();
-}
+function deactivate() { if (socket) socket.disconnect(); }
 
-module.exports = {
-    activate,
-    deactivate
-};
+module.exports = { activate, deactivate };
