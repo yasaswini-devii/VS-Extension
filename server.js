@@ -1,21 +1,27 @@
 const io = require("socket.io")(3000, {
-    cors: { origin: "*" } // Allows connections from VS Code
+    cors: {
+        origin: "*", // This allows VS Code to connect
+        methods: ["GET", "POST"]
+    }
 });
 
-console.log("CodeSync Server running on port 3000...");
+console.log("--- CodeSync Server Started ---");
+console.log("Listening on port: 3000");
 
 io.on("connection", (socket) => {
-    console.log(`User connected: ${socket.id}`);
+    // This MUST log as soon as the extension starts
+    console.log(`NEW CONNECTION: ${socket.id}`);
 
-    // When Person A sends an update...
+    socket.on("join_repo", (repoId) => {
+        socket.join(repoId);
+        console.log(`User joined Repo Room: ${repoId}`);
+    });
+
     socket.on("file_editing", (data) => {
-        console.log(`${data.user} is editing ${data.file}`);
-        
-        // ...Broadcast it to Person B (everyone else)
-        socket.broadcast.emit("show_toast", data);
+        socket.to(data.repo).emit("show_toast", data);
     });
 
     socket.on("disconnect", () => {
-        console.log("User disconnected");
+        console.log(`User disconnected: ${socket.id}`);
     });
 });
