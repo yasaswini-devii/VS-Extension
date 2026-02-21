@@ -6,17 +6,33 @@ const repoState = {};
 
 function ensureRepo(repoId) {
     if (!repoState[repoId]) {
-        repoState[repoId] = { editing: {}, unpushed: {} };
+        repoState[repoId] = { editing: {}, unpushed: {}, presence: {} };
     }
-    console.log(repoId);
+    if (!repoState[repoId].presence) repoState[repoId].presence = {};
     return repoState[repoId];
 }
 
 io.on("connection", (socket) => {
-    socket.on("join_repo", (repoId) => {
-        console.log(`Joined repo ${repoId}`);
+    socket.on("join_repo", (data) => {
+        // Handle if data is an object {repoId, email} or just a string
+        const repoId = typeof data === 'object' ? data.repoId : data;
+        const email = (data && data.email) ? data.email : "unknown-user";
+
         socket.join(repoId);
-        socket.emit("sync_state", ensureRepo(repoId));
+        socket.repoId = repoId;
+        socket.email = email; // Store for disconnect logic
+
+        const state = ensureRepo(repoId);
+        
+        // 🔹 Track presence by email
+        state.presence[email] = {
+            status: 'online',
+            currentFile: 'Browsing',
+            lastSeen: Date.now()
+        };
+
+        socket.emit("sync_state", state);
+        io.to(repoId).emit("presence_update", state.presence);
     });
 
     socket.on("file_editing", (data) => {
@@ -24,6 +40,17 @@ io.on("connection", (socket) => {
         console.log(data.file, data.user);
         state.editing[data.file] = data.user;
         socket.to(data.repo).emit("update_editing", data);
+    });
+
+    socket.on("disconnect", () => {
+        if (socket.email && socket.repoId) {
+            const state = repoState[socket.repoId];
+            if (state && state.presence[socket.email]) {
+                state.presence[socket.email].status = 'offline';
+                state.presence[socket.email].currentFile = null;
+                io.to(socket.repoId).emit("presence_update", state.presence);
+            }
+        }
     });
 
     socket.on("file_committed", (data) => {

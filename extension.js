@@ -9,6 +9,7 @@ const EDIT_DEBOUNCE_MS = 1000; // Increased slightly for "calmer" UI
 const COMMIT_TYPES = ["feat", "fix", "refactor", "perf", "docs", "test", "build", "chore", "ci"];
 let socket;
 let MY_NAME = "Unknown";
+let MY_EMAIL = "unknown@mail.com"; // 🔹 Standardized variable
 const editDebounceTimers = new Map();
 
 class TeamDecorationProvider {
@@ -51,7 +52,11 @@ const decoProvider = new TeamDecorationProvider();
 function activate(context) {
     try {
         MY_NAME = execSync("git config user.name").toString().trim();
-    } catch (e) { MY_NAME = "User-" + Math.floor(Math.random() * 100); }
+        MY_EMAIL = execSync("git config user.email").toString().trim();
+    } catch (e) { 
+        MY_NAME = "User-" + Math.floor(Math.random() * 100);
+        MY_EMAIL = "unknown@mail.com";
+    }
 
     socket = io(SERVER_URL, { transports: ["websocket"] });
     context.subscriptions.push(vscode.window.registerFileDecorationProvider(decoProvider));
@@ -69,7 +74,11 @@ function activate(context) {
 
     socket.on("connect", () => {
         vscode.window.showInformationMessage("Connected to CodeSync Server!");
-        socket.emit("join_repo", getRepoId());
+        // 🔹 Send both Repo ID and Email
+        socket.emit("join_repo", { 
+            repoId: getRepoId(), 
+            email: MY_EMAIL 
+        });
     });
 
     socket.on("sync_state", (state) => {
@@ -126,24 +135,19 @@ function activate(context) {
 
     // 🔹 IMPROVED: Smoother Watcher
     const editWatcher = vscode.workspace.onDidChangeTextDocument(event => {
-    const relativePath = vscode.workspace.asRelativePath(event.document.uri);
+        const relativePath = vscode.workspace.asRelativePath(event.document.uri);
+        if (editDebounceTimers.has(relativePath)) clearTimeout(editDebounceTimers.get(relativePath));
 
-    if (editDebounceTimers.has(relativePath)) {
-        clearTimeout(editDebounceTimers.get(relativePath));
-    }
-
-    const timer = setTimeout(() => {
-        socket.emit("file_editing", {
-            user: MY_NAME,
-            repo: getRepoId(),
-            file: relativePath
-        });
-        editDebounceTimers.delete(relativePath);
-    }, EDIT_DEBOUNCE_MS);
-
-    editDebounceTimers.set(relativePath, timer);
-});
-
+        const timer = setTimeout(() => {
+            socket.emit("file_editing", {
+                userEmail: MY_EMAIL, // 🔹 Send email
+                repo: getRepoId(),
+                file: relativePath
+            });
+            editDebounceTimers.delete(relativePath);
+        }, EDIT_DEBOUNCE_MS);
+        editDebounceTimers.set(relativePath, timer);
+    });
 
 
     // Run heavy git checks every 15s (increased from 10s for performance)
