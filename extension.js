@@ -1,9 +1,12 @@
 const vscode = require("vscode");
-const io = require("socket.io-client");
+const { io } = require("socket.io-client");
 const { execSync, exec } = require("child_process"); // Added exec for async
+const fs = require("fs");
+const path = require("path");
 
 const SERVER_URL = "http://172.16.26.182:3000";
 const EDIT_DEBOUNCE_MS = 1000; // Increased slightly for "calmer" UI
+const COMMIT_TYPES = ["feat", "fix", "refactor", "perf", "docs", "test", "build", "chore", "ci"];
 let socket;
 let MY_NAME = "Unknown";
 const editDebounceTimers = new Map();
@@ -52,6 +55,17 @@ function activate(context) {
 
     socket = io(SERVER_URL, { transports: ["websocket"] });
     context.subscriptions.push(vscode.window.registerFileDecorationProvider(decoProvider));
+
+    const commitWithAiSuggestionCommand = vscode.commands.registerCommand("extension.commitWithAiSuggestion", async () => {
+        await commitWithAiSuggestion();
+    });
+
+    const startMonitoringCommand = vscode.commands.registerCommand("extension.startMonitoring", async () => {
+        checkGitStatus();
+        vscode.window.showInformationMessage("TeamWatcher monitoring is active for this repository.");
+    });
+
+    context.subscriptions.push(commitWithAiSuggestionCommand, startMonitoringCommand);
 
     socket.on("connect", () => {
         vscode.window.showInformationMessage("Connected to CodeSync Server!");
@@ -139,6 +153,274 @@ function activate(context) {
 });
 
 context.subscriptions.push(saveWatcher, editWatcher);}
+
+function runGit(repoRoot, args) {
+    return execSync(`git ${args}`, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+    }).trim();
+}
+
+function getRepoRoot() {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) return null;
+    const folderPath = workspaceFolders[0].uri.fsPath;
+    try {
+        return runGit(folderPath, "rev-parse --show-toplevel");
+    } catch {
+        return null;
+    }
+}
+
+function resolveGitPath(repoRoot, gitRelativeOrAbsolutePath) {
+    if (!gitRelativeOrAbsolutePath) return null;
+    if (path.isAbsolute(gitRelativeOrAbsolutePath)) return gitRelativeOrAbsolutePath;
+    return path.join(repoRoot, gitRelativeOrAbsolutePath);
+}
+
+function disableBrokenLegacyPrepareCommitHook(repoRoot) {
+    let gitDir;
+    try {
+        gitDir = runGit(repoRoot, "rev-parse --git-dir");
+    } catch {
+        return { changed: false };
+    }
+
+    const resolvedGitDir = resolveGitPath(repoRoot, gitDir);
+    if (!resolvedGitDir) return { changed: false };
+
+    const hookPath = path.join(resolvedGitDir, "hooks", "prepare-commit-msg");
+    if (!fs.existsSync(hookPath)) return { changed: false };
+
+    let hookContent = "";
+    try {
+        hookContent = fs.readFileSync(hookPath, "utf8");
+    } catch {
+        return { changed: false };
+    }
+
+    if (!hookContent.includes("aiCommit.js")) {
+        return { changed: false };
+    }
+
+    const referencedPaths = [...hookContent.matchAll(/[A-Za-z]:\\[^\"'\n\r]*aiCommit\.js/g)].map(match => match[0]);
+    const hasMissingReferencedScript = referencedPaths.length > 0 && referencedPaths.some(candidatePath => !fs.existsSync(candidatePath));
+
+    if (!hasMissingReferencedScript) {
+        return { changed: false };
+    }
+
+    const backupPath = `${hookPath}.teamwatcher.bak`;
+    try {
+        fs.copyFileSync(hookPath, backupPath);
+        fs.unlinkSync(hookPath);
+        return { changed: true, backupPath };
+    } catch {
+        return { changed: false };
+    }
+}
+
+function escapeForCommitMessage(message) {
+    return message.replace(/"/g, '\\"');
+}
+
+function parseNameStatus(nameStatusOutput) {
+    return nameStatusOutput
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => {
+            const parts = line.split(/\s+/);
+            const status = parts[0];
+            const filePath = parts[parts.length - 1];
+            return { status, filePath };
+        });
+}
+
+function detectScope(entries) {
+    if (!entries.length) return "repo";
+    const topLevels = entries
+        .map(entry => entry.filePath.split("/")[0])
+        .filter(Boolean);
+    const uniqueTopLevels = [...new Set(topLevels)];
+    if (uniqueTopLevels.length === 1) {
+        return uniqueTopLevels[0].replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+    }
+    const firstFile = entries[0].filePath;
+    const baseName = firstFile.split("/").pop() || "repo";
+    return baseName.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
+}
+
+function detectType(entries, diffText) {
+    if (!entries.length) return "chore";
+
+    const files = entries.map(entry => entry.filePath.toLowerCase());
+    const onlyDocs = files.every(file => file.includes("readme") || file.endsWith(".md") || file.startsWith("docs/"));
+    if (onlyDocs) return "docs";
+
+    const onlyTests = files.every(file => file.includes("test") || file.includes("spec"));
+    if (onlyTests) return "test";
+
+    const onlyBuildFiles = files.every(file =>
+        file.includes("package.json") ||
+        file.includes("package-lock.json") ||
+        file.includes("eslint") ||
+        file.includes("tsconfig") ||
+        file.includes("vite.config") ||
+        file.includes("webpack") ||
+        file.includes(".github/")
+    );
+    if (onlyBuildFiles) return "build";
+
+    const lowerDiff = diffText.toLowerCase();
+    if (/\b(fix|bug|error|prevent|handle|fallback|null|undefined|crash)\b/.test(lowerDiff)) return "fix";
+    if (/\b(refactor|cleanup|rename|extract|simplify)\b/.test(lowerDiff)) return "refactor";
+    if (/\b(optimize|performance|cache|memoize|faster|latency)\b/.test(lowerDiff)) return "perf";
+
+    const hasAdded = entries.some(entry => entry.status.startsWith("A"));
+    if (hasAdded) return "feat";
+    return "chore";
+}
+
+function buildSubject(type, scope, entries) {
+    if (!entries.length) return `update ${scope} changes`;
+    const statuses = new Set(entries.map(entry => entry.status[0]));
+    const firstFile = entries[0].filePath;
+    const normalizedName = (firstFile.split("/").pop() || scope)
+        .replace(/\.[^.]+$/, "")
+        .replace(/[-_]+/g, " ")
+        .toLowerCase();
+
+    if (statuses.size === 1 && statuses.has("A")) {
+        return `add ${normalizedName} implementation`;
+    }
+    if (statuses.size === 1 && statuses.has("D")) {
+        return `remove ${normalizedName} implementation`;
+    }
+    if (type === "fix") {
+        return `resolve ${normalizedName} behavior issues`;
+    }
+    if (type === "docs") {
+        return `update ${normalizedName} documentation`;
+    }
+    if (type === "test") {
+        return `add coverage for ${normalizedName}`;
+    }
+    if (type === "build") {
+        return `update ${normalizedName} build configuration`;
+    }
+    if (type === "feat") {
+        return `add ${normalizedName} support`;
+    }
+    return `update ${scope} implementation`;
+}
+
+function isConventionalCommit(message) {
+    const trimmed = message.trim();
+    if (!trimmed) return false;
+    if (trimmed.length > 72) return false;
+    const pattern = new RegExp(`^(${COMMIT_TYPES.join("|")})(\\([a-z0-9-./]+\\))?: [a-z][^A-Z]*$`);
+    return pattern.test(trimmed);
+}
+
+async function ensureStagedChanges(repoRoot) {
+    const staged = runGit(repoRoot, "diff --cached --name-status");
+    if (staged) return true;
+
+    let unstaged = "";
+    try {
+        unstaged = runGit(repoRoot, "status --porcelain");
+    } catch {
+        unstaged = "";
+    }
+
+    if (!unstaged) return false;
+
+    const choice = await vscode.window.showQuickPick(
+        [
+            { label: "Stage all changes and continue", value: "stage" },
+            { label: "Cancel", value: "cancel" }
+        ],
+        { placeHolder: "No staged changes found. What should TeamWatcher do?" }
+    );
+
+    if (!choice || choice.value !== "stage") return false;
+    runGit(repoRoot, "add -A");
+    return true;
+}
+
+async function commitWithAiSuggestion() {
+    const repoRoot = getRepoRoot();
+    if (!repoRoot) {
+        vscode.window.showErrorMessage("TeamWatcher: Open a Git repository workspace to use AI commit suggestions.");
+        return;
+    }
+
+    let hasStagedChanges;
+    try {
+        hasStagedChanges = await ensureStagedChanges(repoRoot);
+    } catch (error) {
+        vscode.window.showErrorMessage(`TeamWatcher: Failed to inspect changes. ${error.message}`);
+        return;
+    }
+
+    if (!hasStagedChanges) {
+        vscode.window.showWarningMessage("TeamWatcher: No changes available to commit.");
+        return;
+    }
+
+    const hookRepairResult = disableBrokenLegacyPrepareCommitHook(repoRoot);
+    if (hookRepairResult.changed) {
+        vscode.window.showWarningMessage(
+            `TeamWatcher: Disabled broken legacy prepare-commit-msg hook (backup: ${hookRepairResult.backupPath}).`
+        );
+    }
+
+    let entries = [];
+    let diffText = "";
+
+    try {
+        const nameStatus = runGit(repoRoot, "diff --cached --name-status");
+        entries = parseNameStatus(nameStatus);
+        diffText = runGit(repoRoot, "diff --cached --unified=0 --no-color");
+    } catch (error) {
+        vscode.window.showErrorMessage(`TeamWatcher: Unable to analyze staged diff. ${error.message}`);
+        return;
+    }
+
+    const type = detectType(entries, diffText);
+    const scope = detectScope(entries);
+    const subject = buildSubject(type, scope, entries);
+    const suggestion = `${type}(${scope}): ${subject}`;
+
+    const finalMessage = await vscode.window.showInputBox({
+        title: "Commit Using AI Suggestion",
+        prompt: "Use format: type(scope): short, lowercase summary",
+        value: suggestion,
+        ignoreFocusOut: true,
+        validateInput: value => {
+            if (!value || !value.trim()) return "Commit message is required.";
+            if (value.trim().length > 72) return "Keep the subject line at 72 characters or less.";
+            if (!isConventionalCommit(value.trim())) {
+                return "Expected format: feat(scope): concise lowercase summary";
+            }
+            return null;
+        }
+    });
+
+    if (!finalMessage) {
+        vscode.window.showInformationMessage("TeamWatcher: Commit cancelled.");
+        return;
+    }
+
+    try {
+        runGit(repoRoot, `commit -m "${escapeForCommitMessage(finalMessage.trim())}"`);
+        vscode.window.showInformationMessage(`Committed: ${finalMessage.trim()}`);
+    } catch (error) {
+        vscode.window.showErrorMessage(`TeamWatcher: Commit failed. ${error.message}`);
+    }
+}
 
 // 🔹 IMPROVED: Using async exec to prevent UI "micro-freezes"
 function checkGitReminders() {
