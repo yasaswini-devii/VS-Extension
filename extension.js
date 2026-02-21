@@ -1,16 +1,20 @@
 const vscode = require("vscode");
 const { io } = require("socket.io-client");
-const { execSync, exec } = require("child_process"); // Added exec for async
+const { execSync, exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
 const SERVER_URL = "http://172.16.26.182:3000";
-const EDIT_DEBOUNCE_MS = 1000; // Increased slightly for "calmer" UI
+const EDIT_DEBOUNCE_MS = 1000;
 const COMMIT_TYPES = ["feat", "fix", "refactor", "perf", "docs", "test", "build", "chore", "ci"];
 let socket;
 let MY_NAME = "Unknown";
-let MY_EMAIL = "unknown@mail.com"; // 🔹 Standardized variable
+let MY_EMAIL = "unknown@mail.com";
 const editDebounceTimers = new Map();
+
+// 🔹 Sensitive files protection - added from second code
+let shownCategoryWarnings = new Set();
+let handledIgnoreEntries = new Set();
 
 class TeamDecorationProvider {
     constructor() {
@@ -74,7 +78,6 @@ function activate(context) {
 
     socket.on("connect", () => {
         vscode.window.showInformationMessage("Connected to CodeSync Server!");
-        // 🔹 Send both Repo ID and Email
         socket.emit("join_repo", { 
             repoId: getRepoId(), 
             email: MY_EMAIL 
@@ -82,65 +85,59 @@ function activate(context) {
     });
 
     socket.on("sync_state", (state) => {
-    // Filter Editing: Remove any entries where the user is ME
-    const filteredEditing = new Map();
-    for (const [file, user] of Object.entries(state.editing)) {
-        if (user !== MY_NAME) {
-            filteredEditing.set(file, user);
+        const filteredEditing = new Map();
+        for (const [file, user] of Object.entries(state.editing)) {
+            if (user !== MY_NAME) {
+                filteredEditing.set(file, user);
+            }
         }
-    }
-    decoProvider.editingFiles = filteredEditing;
+        decoProvider.editingFiles = filteredEditing;
 
-    // Filter Unpushed: Remove ME from the arrays
-    const filteredUnpushed = Object.entries(state.unpushed).reduce((acc, [file, users]) => {
-        const others = users.filter(u => u !== MY_NAME);
-        if (others.length > 0) acc.push([file, others]);
-        return acc;
-    }, []);
-    
-    decoProvider.unpushedFiles = new Map(filteredUnpushed);
-    decoProvider.refresh();
-});
+        const filteredUnpushed = Object.entries(state.unpushed).reduce((acc, [file, users]) => {
+            const others = users.filter(u => u !== MY_NAME);
+            if (others.length > 0) acc.push([file, others]);
+            return acc;
+        }, []);
+        
+        decoProvider.unpushedFiles = new Map(filteredUnpushed);
+        decoProvider.refresh();
+    });
 
     socket.on("update_editing", (data) => {
-    // 🛑 STOP: If the message is about me, ignore it immediately.
-    if (data.user === MY_NAME) return;
+        if (data.user === MY_NAME) return;
 
-    // Only add to the map if it's someone else
-    decoProvider.editingFiles.set(data.file, data.user);
-    decoProvider.refresh();
+        decoProvider.editingFiles.set(data.file, data.user);
+        decoProvider.refresh();
 
-    // Auto-clear their icon after 15s of silence
-    setTimeout(() => {
-        if (decoProvider.editingFiles.get(data.file) === data.user) {
-            decoProvider.editingFiles.delete(data.file);
-            decoProvider.refresh();
-        }
-    }, 15000);
-});
+        setTimeout(() => {
+            if (decoProvider.editingFiles.get(data.file) === data.user) {
+                decoProvider.editingFiles.delete(data.file);
+                decoProvider.refresh();
+            }
+        }, 15000);
+    });
 
     socket.on("update_unpushed", (unpushedObj) => {
-    const filtered = Object.entries(unpushedObj).reduce((acc, [file, users]) => {
-        const others = users.filter(u => u !== MY_NAME);
-        // Only add the file to the map if someone OTHER than you has changes
-        if (others.length > 0) {
-            acc.push([file, others]);
-        }
-        return acc;
-    }, []);
+        const filtered = Object.entries(unpushedObj).reduce((acc, [file, users]) => {
+            const others = users.filter(u => u !== MY_NAME);
+            if (others.length > 0) {
+                acc.push([file, others]);
+            }
+            return acc;
+        }, []);
 
-    decoProvider.unpushedFiles = new Map(filtered);
-    decoProvider.refresh();
-});
+        decoProvider.unpushedFiles = new Map(filtered);
+        decoProvider.refresh();
+    });
 
-    // 🔹 IMPROVED: Smoother Watcher
+    // 🔹 File edit watcher with sensitive files check
     const editWatcher = vscode.workspace.onDidChangeTextDocument(event => {
         const relativePath = vscode.workspace.asRelativePath(event.document.uri);
         if (editDebounceTimers.has(relativePath)) clearTimeout(editDebounceTimers.get(relativePath));
 
         const timer = setTimeout(() => {
             socket.emit("file_editing", {
-                userEmail: MY_EMAIL, // 🔹 Send email
+                userEmail: MY_EMAIL,
                 repo: getRepoId(),
                 file: relativePath
             });
@@ -149,14 +146,102 @@ function activate(context) {
         editDebounceTimers.set(relativePath, timer);
     });
 
-
-    // Run heavy git checks every 15s (increased from 10s for performance)
+    // 🔹 Save watcher with sensitive files check
     const saveWatcher = vscode.workspace.onDidSaveTextDocument(document => {
-    // Immediate check when a file is saved
-    checkGitStatus();
-});
+        checkGitStatus();
+    });
 
-context.subscriptions.push(saveWatcher, editWatcher);}
+    // 🔹 Periodic staged file check (every 2 seconds) - from second code
+    const stagedCheckInterval = setInterval(() => {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) return;
+        checkStagedFiles(workspaceFolders[0].uri.fsPath);
+    }, 2000);
+
+    context.subscriptions.push(saveWatcher, editWatcher, { dispose: () => clearInterval(stagedCheckInterval) });
+}
+
+// 🔹 NEW FUNCTION: Check staged files for sensitive content
+function checkStagedFiles(repoRoot) {
+    try {
+        const output = execSync("git diff --cached --name-only", {
+            cwd: repoRoot,
+            encoding: "utf8"
+        }).trim();
+
+        if (!output) return;
+
+        const stagedFiles = output.split("\n");
+
+        let foundEnv = false;
+        let foundNodeModules = false;
+        let foundLargeFile = false;
+
+        const gitignorePath = path.join(repoRoot, ".gitignore");
+        let gitignoreContent = "";
+
+        if (fs.existsSync(gitignorePath)) {
+            gitignoreContent = fs.readFileSync(gitignorePath, "utf8");
+        }
+
+        const gitignoreLines = gitignoreContent
+            .split("\n")
+            .map(l => l.trim());
+
+        stagedFiles.forEach(file => {
+            const normalizedFile = file.replace(/\\/g, "/");
+            const fullPath = path.join(repoRoot, file);
+
+            if (!fs.existsSync(fullPath)) return;
+
+            const fileSize = fs.statSync(fullPath).size;
+            const isLarge = fileSize > 5 * 1024 * 1024;
+            const isEnv = normalizedFile.endsWith(".env");
+            const isNodeModules = normalizedFile.includes("node_modules/");
+
+            let ignoreEntry = null;
+
+            if (isNodeModules) {
+                foundNodeModules = true;
+                const parts = normalizedFile.split("/");
+                const index = parts.indexOf("node_modules");
+                ignoreEntry = parts.slice(0, index + 1).join("/") + "/";
+            } else if (isEnv) {
+                foundEnv = true;
+                ignoreEntry = normalizedFile;
+            } else if (isLarge) {
+                foundLargeFile = true;
+                ignoreEntry = normalizedFile;
+            } else {
+                return;
+            }
+
+            if (ignoreEntry && !gitignoreLines.includes(ignoreEntry) && !handledIgnoreEntries.has(ignoreEntry)) {
+                fs.appendFileSync(gitignorePath, `\n${ignoreEntry}\n`);
+                handledIgnoreEntries.add(ignoreEntry);
+            }
+
+            execSync(`git restore --staged "${file}"`, { cwd: repoRoot });
+        });
+
+        if (foundEnv && !shownCategoryWarnings.has("env")) {
+            vscode.window.showErrorMessage("🚨 .env file detected. Removed from staging.");
+            shownCategoryWarnings.add("env");
+        }
+
+        if (foundNodeModules && !shownCategoryWarnings.has("node_modules")) {
+            vscode.window.showErrorMessage("🚨 node_modules detected. Removed from staging.");
+            shownCategoryWarnings.add("node_modules");
+        }
+
+        if (foundLargeFile && !shownCategoryWarnings.has("large_file")) {
+            vscode.window.showErrorMessage("🚨 Large file (>5MB) detected. Removed from staging.");
+            shownCategoryWarnings.add("large_file");
+        }
+    } catch (e) {
+        console.error("Staged File Check Error:", e.message);
+    }
+}
 
 function runGit(repoRoot, args) {
     return execSync(`git ${args}`, {
@@ -426,7 +511,6 @@ async function commitWithAiSuggestion() {
     }
 }
 
-// 🔹 IMPROVED: Using async exec to prevent UI "micro-freezes"
 function checkGitReminders() {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) return;
@@ -457,14 +541,9 @@ function checkGitStatus() {
     const root = vscode.workspace.workspaceFolders[0].uri.fsPath;
     const repoId = getRepoId();
     
-    // This command finds:
-    // 1. Unpushed commits: @{u}..HEAD
-    // 2. Unstaged/Staged changes: HEAD (tracked files only)
-    // 3. Untracked files: --others --exclude-standard
     const cmd = 'git diff --name-only @{u} HEAD && git ls-files -m --others --exclude-standard';
 
     exec(cmd, { cwd: root }, (err, stdout) => {
-        // If there's an error (e.g., no upstream set), we fall back to just local changes
         let output = stdout;
         if (err) {
             try {
@@ -474,23 +553,23 @@ function checkGitStatus() {
 
         const allChangedFiles = [...new Set(output.trim().split("\n").filter(Boolean))];
         
-        // Inside checkGitStatus()
-if (allChangedFiles.length > 0) {
-    socket.emit("file_committed", { 
-        repo: repoId, 
-        files: allChangedFiles, 
-        user: MY_NAME 
-    });
-} else {
-    // FIX: Only tell the server to clear YOUR changes, not the whole repo
-    socket.emit("user_cleared_changes", {
-        repo: repoId,
-        user: MY_NAME
-    });
-}
+        if (allChangedFiles.length > 0) {
+            socket.emit("file_committed", { 
+                repo: repoId, 
+                files: allChangedFiles, 
+                user: MY_NAME 
+            });
+        } else {
+            socket.emit("user_cleared_changes", {
+                repo: repoId,
+                user: MY_NAME
+            });
+        }
     });
 }
 
-function deactivate() { if (socket) socket.disconnect(); }
+function deactivate() { 
+    if (socket) socket.disconnect(); 
+}
 
 module.exports = { activate, deactivate };
